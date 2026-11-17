@@ -4,7 +4,8 @@
     "count": 10,
     "max_per_source": 2,
     "window_hours": 24,
-    "paused": false
+    "paused": false,
+    "user_cooldown_min": 0
   },
   "telegram": {
     "ru": [
