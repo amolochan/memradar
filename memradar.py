@@ -5,25 +5,34 @@
   * Lemmy: открытая альтернатива Reddit, публичный API без ключей;
   * Reddit: если в секретах указаны REDDIT_CLIENT_ID и REDDIT_CLIENT_SECRET.
 
+Кто чем управляет:
+  * владелец (секрет OWNER_ID): источники, настройки, подписчики;
+  * подписчики (любой, кто нажал /start): получают подборки и могут запросить их вручную.
+  Данные подписчиков хранятся в state.json в зашифрованном виде (ключ получается из BOT_TOKEN).
+
 Режимы (python memradar.py --mode ...):
-  auto     запускается по расписанию: обрабатывает команды из чата и, если пора, шлёт подборку
-  digest   прислать подборку сейчас (кнопка Run workflow на GitHub)
-  command  выполнить одну команду (--cmd "/top 5 ua"), так работает мгновенный режим через воркер
-  test     проверить источники: прислать отчёт, сколько постов удалось прочитать с каждого
+  auto     по расписанию: обрабатывает сообщения из чата и, если пора, рассылает подборку всем
+  digest   прислать подборку владельцу сейчас (кнопка Run workflow на GitHub)
+  command  обработать одно сообщение или нажатие кнопки, переданное воркером (--cmd JSON)
+  test     проверить источники: прислать владельцу отчёт
+  merge    служебный: слить состояние с параллельным запуском перед git push
 """
 import argparse
+import base64
+import hashlib
 import html
 import json
 import os
 import re
+import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from cryptography.fernet import Fernet, InvalidToken
 
 from scoring import hot_scores, is_ad
 
@@ -36,21 +45,30 @@ REDDIT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 API = f"https://api.telegram.org/bot{TOKEN}"
 LANGS = ("ru", "ua", "en")
+USER_COOLDOWN = 10 * 60           # подписчик может запросить подборку вручную раз в 10 минут
 
-HELP = """<b>Мем-радар</b>: самые залетевшие мемы из Telegram, Lemmy и Reddit.
+HELP_OWNER = """<b>Мем-радар</b>: самые залетевшие мемы из Telegram, Lemmy и Reddit.
 
 Всё управление — <b>кнопками внизу чата</b>:
-🔥 <b>Топ за сутки</b>: лучшие мемы за 24 часа
-⚡ <b>Залетает сейчас</b>: что набирает обороты за 4 часа
-🎬 <b>Только видео</b>: для вставок в монтаж
+🔥 <b>Топ за сутки</b> · ⚡ <b>Залетает сейчас</b> · 🎬 <b>Только видео</b>
 📋 <b>Источники</b>: откуда берутся мемы
 ➕ <b>Добавить</b> / ➖ <b>Удалить</b> источник
 ⚙️ <b>Настройки</b>: как часто и сколько присылать, пауза
+👥 <b>Подписчики</b>: кто получает подборки, блокировка
 
-Добавить канал можно и проще: просто пришлите сюда ссылку на него (t.me/…) или @ник.
+Добавить канал можно и проще: пришлите ссылку на него (t.me/…) или @ник.
+Друзьям отправьте ссылку на бота: после /start они будут получать подборки,
+а источники и настройки меняете только вы."""
 
-⏳ Если мгновенный режим не настроен (шаг 9 инструкции), бот проверяет чат раз в 10 минут,
-поэтому ответ на кнопку приходит в течение 10–20 минут."""
+HELP_USER = """<b>Мем-радар</b> присылает самые залетевшие мемы из Telegram, Lemmy и Reddit.
+
+📬 Подборка приходит автоматически каждые {every} ч.
+🔥 <b>Топ за сутки</b>: лучшие мемы за 24 часа
+⚡ <b>Залетает сейчас</b>: что набирает обороты за 4 часа
+🎬 <b>Только видео</b>: для монтажа
+🔕 <b>Отписаться</b>: перестать получать подборки
+
+Ручной запрос: не чаще раза в 10 минут. Ответ приходит за 1–2 минуты."""
 
 
 def log(*a):
@@ -64,6 +82,24 @@ def load(path, default):
         return default
 
 
+# ---------------------------------------------------------------- шифрование данных подписчиков
+FERNET = Fernet(base64.urlsafe_b64encode(hashlib.sha256(("memradar:" + TOKEN).encode()).digest())) if TOKEN else None
+
+
+def decrypt(blob):
+    if not blob or not FERNET:
+        return {}
+    try:
+        return json.loads(FERNET.decrypt(blob.encode()))
+    except (InvalidToken, ValueError):
+        log("Не удалось расшифровать данные подписчиков (сменился BOT_TOKEN?), начинаю список заново")
+        return {}
+
+
+def encrypt(obj):
+    return FERNET.encrypt(json.dumps(obj, ensure_ascii=False, sort_keys=True).encode()).decode()
+
+
 SRC = load(SRC_FILE, {})
 STATE = load(STATE_FILE, {})
 STATE.setdefault("sent", [])
@@ -75,16 +111,32 @@ for k, v in {"every_hours": 4, "count": 8, "max_per_source": 2, "window_hours": 
 SRC.setdefault("telegram", {l: [] for l in LANGS})
 SRC.setdefault("lemmy", [])
 SRC.setdefault("reddit", [])
+PRIV = decrypt(STATE.get("private"))
+_PRIV_SNAPSHOT = json.dumps(PRIV, sort_keys=True, ensure_ascii=False)
+PRIV.setdefault("subs", {})       # chat_id -> {"name", "since", "last", "active"}
+PRIV.setdefault("banned", {})     # chat_id -> name
+PRIV.setdefault("seen", {})       # chat_id -> [id мемов, которые уже получил вручную]
+PRIV.setdefault("await", {})      # chat_id -> "add" (владелец ждёт ввода источника)
+if STATE.get("owner"):            # старая версия хранила владельца открыто
+    PRIV.setdefault("owner", STATE.pop("owner"))
 
 
 def save():
     STATE["sent"] = STATE["sent"][-4000:]
+    for k in list(PRIV["seen"]):
+        PRIV["seen"][k] = PRIV["seen"][k][-500:]
+    if FERNET and (json.dumps(PRIV, sort_keys=True, ensure_ascii=False) != _PRIV_SNAPSHOT or "private" not in STATE):
+        STATE["private"] = encrypt(PRIV)
     SRC_FILE.write_text(json.dumps(SRC, ensure_ascii=False, indent=2) + "\n", "utf-8")
     STATE_FILE.write_text(json.dumps(STATE, ensure_ascii=False, indent=1) + "\n", "utf-8")
 
 
 def owner_chat():
-    return OWNER or STATE.get("owner")
+    return OWNER or PRIV.get("owner")
+
+
+def is_owner(uid):
+    return bool(owner_chat()) and str(uid) == str(owner_chat())
 
 
 # ---------------------------------------------------------------- Telegram Bot API
@@ -112,7 +164,7 @@ def edit(chat, mid, text, kb=None):
     j = tg("editMessageText", chat_id=chat, message_id=mid, text=text, parse_mode="HTML",
            disable_web_page_preview="true", **extra)
     if not j.get("ok") and "not modified" not in str(j.get("description", "")):
-        say(text, chat, kb)                    # старое сообщение не редактируется: шлём новое
+        say(text, chat, kb)
 
 
 # ---------------------------------------------------------------- источники
@@ -264,7 +316,7 @@ def fetch_reddit(sub, hours):
     return out
 
 
-def collect(lang="all", hours=24, only_video=False, report=None):
+def collect(lang="all", hours=24, only_video=False, report=None, exclude=None):
     pool = []
     for lg, chans in SRC["telegram"].items():
         if lang in ("all", lg):
@@ -284,8 +336,8 @@ def collect(lang="all", hours=24, only_video=False, report=None):
             if report is not None and (REDDIT_ID and REDDIT_SECRET):
                 report.append(f"r/{sub}: {len(ps)}")
             pool += ps
-    sent = set(STATE["sent"])
-    pool = [p for p in pool if p["id"] not in sent and (not only_video or p["kind"] == "video")]
+    ex = exclude if exclude is not None else set(STATE["sent"])
+    pool = [p for p in pool if p["id"] not in ex and (not only_video or p["kind"] == "video")]
     pool.sort(key=lambda p: p["score"], reverse=True)
     per, top = {}, []
     for p in pool:
@@ -308,9 +360,27 @@ def caption(p, n):
             + (f"{text}\n" if text else "") + f'<a href="{p["link"]}">Оригинал</a>')
 
 
-def send_post(chat, p, n):
+def file_id_of(res):
+    if not isinstance(res, dict):
+        return None
+    for k in ("video", "animation", "document"):
+        if res.get(k):
+            return res[k].get("file_id")
+    if res.get("photo"):
+        return res["photo"][-1].get("file_id")
+    return None
+
+
+def send_post(chat, p, n, cache):
+    """Отправляет мем. cache[id] хранит file_id, чтобы не заливать один файл много раз.
+    Возвращает 'ok', 'blocked' (пользователь заблокировал бота) или 'fail'."""
     cap = caption(p, n)
-    if p.get("media"):
+    method, field = ("sendVideo", "video") if p["kind"] == "video" else ("sendPhoto", "photo")
+    extra = {"supports_streaming": "true"} if p["kind"] == "video" else {}
+    j = None
+    if cache.get(p["id"]):
+        j = tg(method, chat_id=chat, caption=cap, parse_mode="HTML", **{field: cache[p["id"]]}, **extra)
+    elif p.get("media"):
         try:
             r = requests.get(p["media"], headers={"User-Agent": UA}, timeout=90, stream=True)
             limit = (49 if p["kind"] == "video" else 9) * 1024 * 1024
@@ -320,49 +390,107 @@ def send_post(chat, p, n):
                 if len(data) > limit:
                     raise ValueError("файл слишком большой")
             ext = ".mp4" if p["kind"] == "video" else ".jpg"
-            method, field = ("sendVideo", "video") if p["kind"] == "video" else ("sendPhoto", "photo")
-            extra = {"supports_streaming": "true"} if p["kind"] == "video" else {}
             j = tg(method, chat_id=chat, caption=cap, parse_mode="HTML", files={field: ("meme" + ext, data)}, **extra)
-            if j.get("ok"):
-                return True
+            fid = file_id_of(j.get("result")) if j.get("ok") else None
+            if fid:
+                cache[p["id"]] = fid
         except Exception as e:
             log("медиа не отправилось:", p["link"], e)
-    # запасной вариант: ссылка, Telegram покажет превью поста
-    j = tg("sendMessage", chat_id=chat, text=cap, parse_mode="HTML")
-    return j.get("ok", False)
+    if not (j and j.get("ok")):
+        if j and j.get("error_code") == 403:
+            return "blocked"
+        j = tg("sendMessage", chat_id=chat, text=cap, parse_mode="HTML")   # ссылка: Telegram покажет превью
+    if j.get("error_code") == 403:
+        return "blocked"
+    return "ok" if j.get("ok") else "fail"
 
 
-def digest(chat, n=None, lang="all", hours=None, only_video=False, title="Топ мемов"):
+def recipients():
+    out = [str(owner_chat())] if owner_chat() else []
+    for cid, s in PRIV["subs"].items():
+        if s.get("active", True) and cid not in PRIV["banned"] and cid not in out:
+            out.append(cid)
+    return out
+
+
+def deliver(chats, top, n, title, more=True):
+    cache = {}
+    for chat in chats:
+        if say(f"🔥 <b>{title}</b> · {min(n, len(top))} шт.", chat).get("error_code") == 403:
+            mark_blocked(chat)
+            continue
+        seen = PRIV["seen"].setdefault(str(chat), [])
+        for i, p in enumerate(top[:n], 1):
+            res = send_post(chat, p, i, cache)
+            if res == "blocked":
+                mark_blocked(chat)
+                break
+            if res == "ok":
+                seen.append(p["id"])
+            time.sleep(1.0 if len(cache) < i else 0.1)
+        else:
+            if more:
+                say("Ещё подборку?", chat, MORE_KB)
+
+
+def mark_blocked(chat):
+    s = PRIV["subs"].get(str(chat))
+    if s:
+        s["active"] = False
+        log("Подписчик заблокировал бота, отписываю:", chat)
+
+
+def personal_digest(chat, n=None, lang="all", hours=None, only_video=False, title="Топ мемов"):
     n = n or SET["count"]
     hours = hours or SET["window_hours"]
-    top = collect(lang, hours, only_video)
+    top = collect(lang, hours, only_video, exclude=set(PRIV["seen"].get(str(chat), [])))
     if not top:
-        say("Свежих залётов не нашёл. Попробуйте /top без фильтров или /reset.", chat)
-        return
-    now = datetime.now(timezone.utc).astimezone()
-    say(f"🔥 <b>{title}</b> · {min(n, len(top))} шт. · {lang.upper() if lang != 'all' else 'RU/UA/EN'}", chat)
-    for i, p in enumerate(top[:n], 1):
-        if send_post(chat, p, i):
-            STATE["sent"].append(p["id"])
-        time.sleep(1.5)
-    say("Ещё подборку?", chat, MORE_KB)
-    log(f"Отправлено {min(n, len(top))} мемов, {now:%Y-%m-%d %H:%M}")
+        return say("Свежих залётов пока нет, загляните чуть позже 🙂", chat)
+    deliver([chat], top, n, title)
+
+
+def broadcast(title="Подборка мемов"):
+    chats = recipients()
+    if not chats:
+        return log("Некому слать: нет владельца и подписчиков")
+    top = collect("all", SET["window_hours"])
+    if not top:
+        return log("Свежих мемов для рассылки нет")
+    n = SET["count"]
+    STATE["sent"] += [p["id"] for p in top[:n]]
+    deliver(chats, top, n, title)
+    log(f"Рассылка: {min(n, len(top))} мемов, получателей: {len(chats)}")
 
 
 # ---------------------------------------------------------------- кнопки
 B_TOP, B_HOT, B_VIDEO = "🔥 Топ за сутки", "⚡ Залетает сейчас", "🎬 Только видео"
 B_SRC, B_ADD, B_DEL = "📋 Источники", "➕ Добавить источник", "➖ Удалить источник"
-B_SET, B_HELP = "⚙️ Настройки", "❓ Помощь"
-MAIN_KB = {"keyboard": [[{"text": B_TOP}, {"text": B_HOT}],
-                        [{"text": B_VIDEO}, {"text": B_SRC}],
-                        [{"text": B_ADD}, {"text": B_DEL}],
-                        [{"text": B_SET}, {"text": B_HELP}]],
-           "resize_keyboard": True, "is_persistent": True,
-           "input_field_placeholder": "Нажмите кнопку или пришлите ссылку на канал"}
+B_SET, B_HELP, B_USERS = "⚙️ Настройки", "❓ Помощь", "👥 Подписчики"
+B_UNSUB, B_SUB = "🔕 Отписаться", "🔔 Подписаться"
+OWNER_KB = {"keyboard": [[{"text": B_TOP}, {"text": B_HOT}], [{"text": B_VIDEO}, {"text": B_SRC}],
+                         [{"text": B_ADD}, {"text": B_DEL}], [{"text": B_SET}, {"text": B_USERS}],
+                         [{"text": B_HELP}]],
+            "resize_keyboard": True, "is_persistent": True,
+            "input_field_placeholder": "Нажмите кнопку или пришлите ссылку на канал"}
+
+
+def user_kb(chat):
+    sub = PRIV["subs"].get(str(chat), {}).get("active", False)
+    return {"keyboard": [[{"text": B_TOP}, {"text": B_HOT}], [{"text": B_VIDEO}, {"text": B_HELP}],
+                         [{"text": B_UNSUB if sub else B_SUB}]],
+            "resize_keyboard": True, "is_persistent": True}
+
+
+def kb_for(chat):
+    return OWNER_KB if is_owner(chat) else user_kb(chat)
+
+
 FLAGS = {"ru": "🇷🇺 RU", "ua": "🇺🇦 UA", "en": "🇬🇧 EN"}
-BOT_COMMANDS = [("start", "Меню и кнопки"), ("top", "Топ мемов за сутки"), ("hot", "Что залетает сейчас"),
-                ("video", "Только видео"), ("sources", "Источники"), ("add", "Добавить источник"),
-                ("del", "Удалить источник"), ("settings", "Настройки"), ("help", "Помощь")]
+OWNER_COMMANDS = [("start", "Меню и кнопки"), ("top", "Топ мемов за сутки"), ("hot", "Что залетает сейчас"),
+                  ("video", "Только видео"), ("sources", "Источники"), ("add", "Добавить источник"),
+                  ("del", "Удалить источник"), ("settings", "Настройки"), ("users", "Подписчики"), ("help", "Помощь")]
+USER_COMMANDS = [("start", "Подписаться и открыть меню"), ("top", "Топ мемов за сутки"), ("hot", "Что залетает сейчас"),
+                 ("video", "Только видео"), ("stop", "Отписаться"), ("help", "Помощь")]
 
 
 def btn(text, data):
@@ -384,7 +512,6 @@ def norm_channel(s):
 
 
 def detect_source(text, loose=False):
-    """Понимает, что прислал пользователь: Telegram-канал, сообщество Lemmy или сабреддит."""
     t = text.strip()
     m = re.match(r"^(?:https?://)?(?:www\.|old\.)?(?:reddit\.com/)?/?r/([A-Za-z0-9_]{2,30})/?$", t)
     if m:
@@ -432,12 +559,27 @@ def settings_view():
     return text, kb
 
 
-def menu(chat):
-    tg("setMyCommands", commands=json.dumps([{"command": c, "description": d} for c, d in BOT_COMMANDS], ensure_ascii=False))
-    say(HELP, chat, MAIN_KB)
+def users_view():
+    active = {k: v for k, v in PRIV["subs"].items() if v.get("active", True) and k not in PRIV["banned"]}
+    off = {k: v for k, v in PRIV["subs"].items() if not v.get("active", True) and k not in PRIV["banned"]}
+    lines = [f"<b>👥 Подписчики: {len(active)}</b>"]
+    lines += [f"• {html.escape(v.get('name', k))}" for k, v in active.items()] or ["пока никого: отправьте друзьям ссылку на бота"]
+    if off:
+        lines.append(f"\nОтписались: {len(off)}")
+    if PRIV["banned"]:
+        lines.append(f"Заблокированы: {len(PRIV['banned'])}")
+    rows = [[btn(f"🚫 {v.get('name', k)[:28]}", f"ban:{k}")] for k, v in active.items()]
+    rows += [[btn(f"✅ Разблокировать {name[:20]}", f"unban:{k}")] for k, name in PRIV["banned"].items()]
+    return "\n".join(lines) + ("\n\nНажмите на человека, чтобы заблокировать." if active else ""), ikb(rows + [[btn("✅ Готово", "close")]])
 
 
-# ---------------------------------------------------------------- действия с источниками
+def set_commands(chat, owner):
+    cmds = OWNER_COMMANDS if owner else USER_COMMANDS
+    tg("setMyCommands", commands=json.dumps([{"command": c, "description": d} for c, d in cmds], ensure_ascii=False),
+       scope=json.dumps({"type": "chat", "chat_id": int(chat)}))
+
+
+# ---------------------------------------------------------------- действия владельца с источниками
 def add_tg(ch, lg, chat):
     test = fetch_tg(ch, lg, 24 * 7)
     if not test:
@@ -452,7 +594,7 @@ def add_tg(ch, lg, chat):
         if ch in l:
             l.remove(ch)
     SRC["telegram"].setdefault(lg, []).append(ch)
-    say(f"✅ Добавил @{html.escape(ch)} в {FLAGS[lg]}" + (f"\nМедиапостов за неделю: {len(test)}" if test else ""), chat, MAIN_KB)
+    say(f"✅ Добавил @{html.escape(ch)} в {FLAGS[lg]}" + (f"\nМедиапостов за неделю: {len(test)}" if test else ""), chat, OWNER_KB)
 
 
 def add_lemmy(c, chat):
@@ -461,13 +603,13 @@ def add_lemmy(c, chat):
                    "например <code>memes@lemmy.world</code>.", chat)
     if c not in SRC["lemmy"]:
         SRC["lemmy"].append(c)
-    say(f"✅ Добавил Lemmy {html.escape(c)}", chat, MAIN_KB)
+    say(f"✅ Добавил Lemmy {html.escape(c)}", chat, OWNER_KB)
 
 
 def add_reddit(x, chat):
     if x not in SRC["reddit"]:
         SRC["reddit"].append(x)
-    say(f"✅ Добавил r/{html.escape(x)}" + ("" if REDDIT_ID else "\n⚠️ Reddit заработает, когда добавите ключи (инструкция, шаг 8)."), chat, MAIN_KB)
+    say(f"✅ Добавил r/{html.escape(x)}" + ("" if REDDIT_ID else "\n⚠️ Reddit заработает, когда добавите ключи (инструкция, шаг 8)."), chat, OWNER_KB)
 
 
 def remove_source(typ, name):
@@ -490,7 +632,7 @@ def offer_tg(ch, chat):
 
 
 def ask_add(chat):
-    STATE["await"] = "add"
+    PRIV["await"][str(chat)] = "add"
     say("➕ <b>Пришлите источник</b> одним сообщением:\n\n"
         "• Telegram-канал: ссылка <code>t.me/имя</code> или <code>@имя</code>\n"
         "• Lemmy: <code>memes@lemmy.world</code>\n"
@@ -500,32 +642,67 @@ def ask_add(chat):
 
 def run_test(chat):
     rep = []
-    top = collect("all", 24, report=rep)
+    top = collect("all", 24, report=rep, exclude=set())
     bad = [r for r in rep if r.endswith(": 0")]
     say("🧪 <b>Проверка источников</b> (медиапостов за 24 ч)\n" + "\n".join(rep)
         + f"\n\nВсего кандидатов: {len(top)}"
         + (f"\n⚠️ Пустые: {len(bad)}. Канал мог закрыть веб-версию или ничего не публиковать, такие можно удалить." if bad else ""), chat)
 
 
+# ---------------------------------------------------------------- подписчики
+def subscribe(chat, name):
+    c = str(chat)
+    s = PRIV["subs"].get(c)
+    is_new = s is None
+    PRIV["subs"][c] = {**(s or {"since": int(time.time()), "last": 0}), "name": name or c, "active": True}
+    if is_new and owner_chat():
+        say(f"👤 Новый подписчик: <b>{html.escape(name or c)}</b>\nВсего: {len(recipients()) - 1}", owner_chat(),
+            ikb([[btn("🚫 Заблокировать", f"ban:{c}")]]))
+
+
+def cooldown_left(chat):
+    if is_owner(chat):
+        return 0
+    s = PRIV["subs"].get(str(chat), {})
+    return max(0, int(s.get("last", 0) + USER_COOLDOWN - time.time()))
+
+
+def user_request(chat, fn):
+    left = cooldown_left(chat)
+    if left:
+        return say(f"⏳ Следующую подборку можно запросить через {left // 60 + 1} мин. "
+                   f"А по расписанию она придёт сама каждые {SET['every_hours']} ч.", chat)
+    if not is_owner(chat):
+        PRIV["subs"].setdefault(str(chat), {"since": int(time.time()), "name": str(chat), "active": False})["last"] = int(time.time())
+    fn()
+
+
 # ---------------------------------------------------------------- обработка сообщений и кнопок
-def handle(text, chat):
+SIMPLE = {B_TOP: "/top", B_HOT: "/hot", B_VIDEO: "/video", B_SRC: "/sources", B_ADD: "/add", B_DEL: "/del",
+          B_SET: "/settings", B_HELP: "/help", B_USERS: "/users", B_UNSUB: "/stop", B_SUB: "/start"}
+
+
+def handle(text, chat, name=""):
     text = (text or "").strip()
     if not text:
         return
-    # нижние кнопки
-    simple = {B_TOP: "/top", B_HOT: "/hot", B_VIDEO: "/video", B_SRC: "/sources", B_ADD: "/add",
-              B_DEL: "/del", B_SET: "/settings", B_HELP: "/help"}
-    if text in simple:
-        text = simple[text]
+    chat = str(chat)
+    if chat in PRIV["banned"]:
+        return
+    owner = is_owner(chat)
+    text = SIMPLE.get(text, text)
+
     if not text.startswith("/"):
-        waiting = STATE.pop("await", None) == "add"
+        if not owner:
+            return say("Пользуйтесь кнопками внизу 👇", chat, user_kb(chat))
+        waiting = PRIV["await"].pop(chat, None) == "add"
         src = detect_source(text, loose=waiting)
         if not src:
-            return say("Не понял 🤔 Пользуйтесь кнопками внизу или пришлите ссылку на канал (t.me/…).", chat, MAIN_KB)
-        typ, name = src
-        return offer_tg(name, chat) if typ == "tg" else add_lemmy(name, chat) if typ == "lemmy" else add_reddit(name, chat)
+            return say("Не понял 🤔 Пользуйтесь кнопками внизу или пришлите ссылку на канал (t.me/…).", chat, OWNER_KB)
+        typ, val = src
+        return offer_tg(val, chat) if typ == "tg" else add_lemmy(val, chat) if typ == "lemmy" else add_reddit(val, chat)
 
-    STATE.pop("await", None)
+    PRIV["await"].pop(chat, None)
     parts = text.split()
     cmd, args = parts[0].split("@")[0].lower(), parts[1:]
     n, lang = None, "all"
@@ -535,17 +712,30 @@ def handle(text, chat):
         elif x.lower() in LANGS:
             lang = x.lower()
 
+    # --- доступно всем
     if cmd == "/start":
-        menu(chat)
-    elif cmd == "/help":
-        say(HELP, chat, MAIN_KB)
-    elif cmd == "/top":
-        digest(chat, n, lang, 24)
-    elif cmd == "/hot":
-        digest(chat, n, lang, 4, title="Залетает прямо сейчас")
-    elif cmd == "/video":
-        digest(chat, n, lang, 24, only_video=True, title="Топ видеомемов")
-    elif cmd == "/sources":
+        set_commands(chat, owner)
+        if owner:
+            return say(HELP_OWNER, chat, OWNER_KB)
+        subscribe(chat, name)
+        return say("✅ Вы подписаны!\n\n" + HELP_USER.format(every=SET["every_hours"]), chat, user_kb(chat))
+    if cmd == "/help":
+        return say(HELP_OWNER if owner else HELP_USER.format(every=SET["every_hours"]), chat, kb_for(chat))
+    if cmd == "/top":
+        return user_request(chat, lambda: personal_digest(chat, n, lang, 24))
+    if cmd == "/hot":
+        return user_request(chat, lambda: personal_digest(chat, n, lang, 4, title="Залетает прямо сейчас"))
+    if cmd == "/video":
+        return user_request(chat, lambda: personal_digest(chat, n, lang, 24, only_video=True, title="Топ видеомемов"))
+    if cmd == "/stop" and not owner:
+        if chat in PRIV["subs"]:
+            PRIV["subs"][chat]["active"] = False
+        return say("🔕 Вы отписались от рассылки. Вернуться: кнопка 🔔 Подписаться.", chat, user_kb(chat))
+    if not owner:
+        return say("Эта команда доступна только владельцу бота. Пользуйтесь кнопками внизу 👇", chat, user_kb(chat))
+
+    # --- только владелец
+    if cmd == "/sources":
         say(sources_text(), chat, ikb([[btn("➕ Добавить", "ask:add"), btn("➖ Удалить", "ask:del")]]))
     elif cmd == "/add":
         if not args:
@@ -553,21 +743,24 @@ def handle(text, chat):
         src = detect_source(args[0], loose=True)
         if not src:
             return say("Не понял, что добавить. Пример: <code>/add @канал ua</code>", chat)
-        typ, name = src
+        typ, val = src
         if typ == "tg":
             lg = next((x.lower() for x in args[1:] if x.lower() in LANGS), None)
-            return add_tg(name, lg, chat) if lg else offer_tg(name, chat)
-        return add_lemmy(name, chat) if typ == "lemmy" else add_reddit(name, chat)
+            return add_tg(val, lg, chat) if lg else offer_tg(val, chat)
+        return add_lemmy(val, chat) if typ == "lemmy" else add_reddit(val, chat)
     elif cmd == "/del":
         if args:
             src = detect_source(args[0], loose=True)
-            typ, name = src if src else ("tg", norm_channel(args[0]))
-            ok = remove_source({"tg": "tg", "lemmy": "lm", "reddit": "rd"}[typ], name)
-            return say(f"🗑 Убрал {html.escape(name)}" if ok else f"{html.escape(name)} нет в списке", chat)
+            typ, val = src if src else ("tg", norm_channel(args[0]))
+            ok = remove_source({"tg": "tg", "lemmy": "lm", "reddit": "rd"}[typ], val)
+            return say(f"🗑 Убрал {html.escape(val)}" if ok else f"{html.escape(val)} нет в списке", chat)
         say("➖ Нажмите на источник, чтобы удалить его:", chat, del_kb())
     elif cmd == "/settings":
-        text_, kb_ = settings_view()
-        say(text_, chat, kb_)
+        t, k = settings_view()
+        say(t, chat, k)
+    elif cmd == "/users":
+        t, k = users_view()
+        say(t, chat, k)
     elif cmd == "/every" and args and args[0].isdigit() and 1 <= int(args[0]) <= 24:
         SET["every_hours"] = int(args[0])
         say(f"⏰ Подборка каждые {args[0]} ч.", chat)
@@ -579,34 +772,42 @@ def handle(text, chat):
         say("⏸ Рассылка на паузе." if SET["paused"] else "▶️ Рассылка включена.", chat)
     elif cmd == "/reset":
         STATE["sent"] = []
+        PRIV["seen"] = {}
         say("♻️ Забыл историю: мемы могут повторяться.", chat)
     else:
-        say("Не знаю такой команды 🤔 Пользуйтесь кнопками внизу.", chat, MAIN_KB)
+        say("Не знаю такой команды 🤔 Пользуйтесь кнопками внизу.", chat, OWNER_KB)
 
 
 def handle_cb(data, chat, mid, cb_id=None):
+    chat = str(chat)
     if cb_id:
         tg("answerCallbackQuery", callback_query_id=cb_id)
+    if chat in PRIV["banned"]:
+        return
     kind, _, rest = data.partition(":")
     if kind in ("top", "hot", "video"):
         lang = rest if rest in LANGS else "all"
         if kind == "top":
-            digest(chat, None, lang, 24, title=f"Топ мемов {FLAGS.get(lang, '')}".strip())
-        elif kind == "hot":
-            digest(chat, None, lang, 4, title="Залетает прямо сейчас")
-        else:
-            digest(chat, None, lang, 24, only_video=True, title="Топ видеомемов")
-    elif kind == "ask":
+            return user_request(chat, lambda: personal_digest(chat, None, lang, 24, title=f"Топ мемов {FLAGS.get(lang, '')}".strip()))
+        if kind == "hot":
+            return user_request(chat, lambda: personal_digest(chat, None, lang, 4, title="Залетает прямо сейчас"))
+        return user_request(chat, lambda: personal_digest(chat, None, lang, 24, only_video=True, title="Топ видеомемов"))
+    if kind == "close":
+        return tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup=json.dumps(ikb([])))
+    if not is_owner(chat):
+        return
+
+    if kind == "ask":
         ask_add(chat) if rest == "add" else say("➖ Нажмите на источник, чтобы удалить его:", chat, del_kb())
     elif kind == "add":
-        typ, lg, name = (rest.split(":", 2) + ["", ""])[:3]
-        if typ == "tg" and lg in LANGS and name:
+        typ, lg, val = (rest.split(":", 2) + ["", ""])[:3]
+        if typ == "tg" and lg in LANGS and val:
             tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup=json.dumps(ikb([])))
-            add_tg(name, lg, chat)
+            add_tg(val, lg, chat)
     elif kind == "del":
-        typ, _, name = rest.partition(":")
-        ok = remove_source(typ, name)
-        label = ("@" + name) if typ == "tg" else ("r/" + name) if typ == "rd" else name
+        typ, _, val = rest.partition(":")
+        ok = remove_source(typ, val)
+        label = ("@" + val) if typ == "tg" else ("r/" + val) if typ == "rd" else val
         edit(chat, mid, (f"🗑 Удалил {html.escape(label)}\n\n" if ok else "Этого источника уже нет.\n\n")
              + "➖ Нажмите на источник, чтобы удалить его:", del_kb())
     elif kind in ("every", "count") and rest.isdigit():
@@ -617,55 +818,119 @@ def handle_cb(data, chat, mid, cb_id=None):
         edit(chat, mid, *settings_view())
     elif kind == "reset":
         STATE["sent"] = []
-        edit(chat, mid, settings_view()[0] + "\n\n♻️ История очищена.", settings_view()[1])
+        PRIV["seen"] = {}
+        t, k = settings_view()
+        edit(chat, mid, t + "\n\n♻️ История очищена.", k)
     elif kind == "test":
         run_test(chat)
-    elif kind == "close":
-        tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup=json.dumps(ikb([])))
+    elif kind == "ban" and rest and not is_owner(rest):
+        name = PRIV["subs"].get(rest, {}).get("name", rest)
+        PRIV["banned"][rest] = name
+        if rest in PRIV["subs"]:
+            PRIV["subs"][rest]["active"] = False
+        t, k = users_view()
+        edit(chat, mid, f"🚫 {html.escape(name)} заблокирован.\n\n" + t, k)
+    elif kind == "unban" and rest:
+        name = PRIV["banned"].pop(rest, rest)
+        t, k = users_view()
+        edit(chat, mid, f"✅ {html.escape(name)} разблокирован (подписаться снова он может через /start).\n\n" + t, k)
 
 
-def check_owner(uid, chat):
+def display_name(frm):
+    name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x).strip()
+    if frm.get("username"):
+        name = f"{name} (@{frm['username']})".strip()
+    return name or str(frm.get("id", ""))
+
+
+def ensure_owner(uid, chat):
+    """Если секрет OWNER_ID не задан, владельцем становится первый, кто напишет боту."""
     if not owner_chat():
-        STATE["owner"] = uid
+        PRIV["owner"] = str(uid)
         say("Вы назначены владельцем бота. Чтобы закрепить это, добавьте свой ID в секрет OWNER_ID (инструкция, шаг 5).", chat)
-    if uid != str(owner_chat()):
-        tg("sendMessage", chat_id=chat, text="Это личный бот.")
-        return False
-    return True
 
 
 def poll_commands():
-    """Забирает сообщения и нажатия кнопок, которые пришли боту с прошлого запуска."""
+    """Забирает сообщения и нажатия кнопок, пришедшие с прошлого запуска (когда мгновенный режим не включён)."""
     j = tg("getUpdates", offset=STATE["offset"] + 1, timeout=0, allowed_updates='["message","callback_query"]')
     if not j.get("ok"):
         if j.get("error_code") == 409:
-            log("Включён webhook (мгновенный режим): команды приходят через воркер")
+            log("Включён webhook (мгновенный режим): сообщения приходят через воркер")
         return
     for u in j.get("result", []):
         STATE["offset"] = max(STATE["offset"], u["update_id"])
         if "callback_query" in u:
             cq = u["callback_query"]
-            uid = str(cq["from"]["id"])
             msg = cq.get("message") or {}
-            chat = (msg.get("chat") or {}).get("id") or uid
-            if check_owner(uid, chat):
-                log("Кнопка:", cq.get("data"))
-                handle_cb(cq.get("data", ""), chat, msg.get("message_id"), cq.get("id"))
+            chat = (msg.get("chat") or {}).get("id") or cq["from"]["id"]
+            ensure_owner(cq["from"]["id"], chat)
+            log("Кнопка:", cq.get("data"))
+            handle_cb(cq.get("data", ""), chat, msg.get("message_id"), cq.get("id"))
             continue
         msg = u.get("message") or {}
-        uid = str((msg.get("from") or {}).get("id", ""))
-        chat = msg.get("chat", {}).get("id")
-        text = msg.get("text", "")
-        if not text or not chat:
+        if (msg.get("chat") or {}).get("type") != "private" or not msg.get("text"):
             continue
-        if check_owner(uid, chat):
-            log("Сообщение:", text)
-            handle(text, chat)
+        frm = msg.get("from") or {}
+        ensure_owner(frm.get("id"), msg["chat"]["id"])
+        log("Сообщение:", msg["text"][:50])
+        handle(msg["text"], msg["chat"]["id"], display_name(frm))
+
+
+# ---------------------------------------------------------------- слияние состояния параллельных запусков
+def merge3(base, ours, theirs):
+    if ours == theirs:
+        return ours
+    if ours == base:
+        return theirs
+    if theirs == base:
+        return ours
+    if isinstance(ours, dict) and isinstance(theirs, dict):
+        b = base if isinstance(base, dict) else {}
+        out = {}
+        for k in list(dict.fromkeys(list(theirs) + list(ours))):
+            if k in ours and k in theirs:
+                out[k] = merge3(b.get(k), ours[k], theirs[k])
+            elif k in ours:
+                if not (k in b and b[k] == ours[k]):
+                    out[k] = ours[k]
+            elif not (k in b and b[k] == theirs[k]):
+                out[k] = theirs[k]
+        return out
+    if isinstance(ours, list) and isinstance(theirs, list):
+        b = base if isinstance(base, list) else []
+        removed = [x for x in b if x not in ours or x not in theirs]
+        out = [x for x in theirs if x not in removed]
+        out += [x for x in ours if x not in out and x not in removed]
+        return out
+    if isinstance(ours, (int, float)) and isinstance(theirs, (int, float)) and not isinstance(ours, bool):
+        return max(ours, theirs)                     # offset, last_digest, last: берём более позднее
+    return ours
+
+
+def git_json(rev, path):
+    try:
+        return json.loads(subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True, text=True, check=True).stdout)
+    except Exception:
+        return {}
+
+
+def merge_mode():
+    """Наш коммит (HEAD) не запушился, потому что другой запуск успел раньше: сливаем HEAD~1 (база), HEAD и origin/main."""
+    for path in ("sources.json", "state.json"):
+        base, ours, theirs = git_json("HEAD~1", path), git_json("HEAD", path), git_json("origin/main", path)
+        if path == "state.json":
+            for d in (base, ours, theirs):
+                d["private"] = decrypt(d.get("private"))
+        merged = merge3(base, ours, theirs)
+        if path == "state.json":
+            merged["private"] = encrypt(merged.get("private") or {})
+        (BASE / path).write_text(json.dumps(merged, ensure_ascii=False, indent=2 if path == "sources.json" else 1) + "\n", "utf-8")
+    log("Состояние слито с параллельным запуском")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="auto", choices=["auto", "digest", "command", "test"])
+    ap.add_argument("--mode", default="auto", choices=["auto", "digest", "command", "test", "merge"])
     ap.add_argument("--cmd", default="")
     ap.add_argument("--lang", default="all")
     ap.add_argument("--count", default="")
@@ -673,29 +938,42 @@ def main():
     a = ap.parse_args()
     if not TOKEN:
         sys.exit("Нет BOT_TOKEN: добавьте его в Settings -> Secrets and variables -> Actions (инструкция, шаг 5).")
+    if a.mode == "merge":
+        return merge_mode()
 
     if a.mode == "auto":
         poll_commands()
         due = time.time() - STATE["last_digest"] >= SET["every_hours"] * 3600 - 600
-        if owner_chat() and not SET["paused"] and due:
+        if not SET["paused"] and due and recipients():
             STATE["last_digest"] = time.time()
-            digest(owner_chat(), title="Подборка мемов")
+            broadcast()
         else:
-            log("Подборка пока не нужна" if owner_chat() else "Владелец неизвестен: напишите боту /start")
+            log("Подборка пока не нужна")
     elif a.mode == "digest":
         if not owner_chat():
-            sys.exit("Неизвестен владелец: добавьте секрет OWNER_ID или напишите боту /start и подождите 10 минут.")
-        STATE["last_digest"] = time.time()
-        digest(owner_chat(), int(a.count) if a.count.isdigit() else None,
-               a.lang if a.lang in LANGS else "all", None, a.video == "true", title="Подборка по запросу")
+            sys.exit("Неизвестен владелец: добавьте секрет OWNER_ID.")
+        personal_digest(owner_chat(), int(a.count) if a.count.isdigit() else None,
+                        a.lang if a.lang in LANGS else "all", None, a.video == "true", title="Подборка по запросу")
     elif a.mode == "command":
         c = a.cmd.strip()
-        if c.startswith("__cb__ "):                      # нажатие кнопки, переданное воркером
+        if c.startswith("{"):                              # формат воркера: JSON
+            try:
+                d = json.loads(c)
+            except ValueError:
+                d = {}
+            chat = str(d.get("c") or d.get("u") or "")
+            if chat:
+                ensure_owner(d.get("u"), chat)
+                if d.get("cb") is not None:
+                    log("Кнопка:", d["cb"])
+                    handle_cb(d["cb"], chat, d.get("mid"))
+                else:
+                    log("Сообщение:", (d.get("t") or "")[:50])
+                    handle(d.get("t", ""), chat, d.get("n", ""))
+        elif c.startswith("__cb__ ") and owner_chat():     # старый формат воркера
             _, mid, data = (c.split(" ", 2) + ["", ""])[:3]
-            log("Кнопка из воркера:", data)
             handle_cb(data, owner_chat(), int(mid) if mid.isdigit() else None)
-        elif c:
-            log("Сообщение из воркера:", c)
+        elif c and owner_chat():
             handle(c, owner_chat())
     elif a.mode == "test":
         run_test(owner_chat())
