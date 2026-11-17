@@ -1,0 +1,73 @@
+name: Мем-радар
+
+on:
+  schedule:
+    - cron: "3-59/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Что сделать"
+        type: choice
+        default: digest
+        options: [digest, test, auto, command]
+      lang:
+        description: "Язык подборки"
+        type: choice
+        default: all
+        options: [all, ru, ua, en]
+      count:
+        description: "Сколько мемов (пусто = как в настройках)"
+        required: false
+        default: ""
+      video:
+        description: "Только видео"
+        type: boolean
+        default: false
+      cmd:
+        description: "Команда (для режима command)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: memradar
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Запуск
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          MODE: ${{ inputs.mode || 'auto' }}
+          LANG_IN: ${{ inputs.lang || 'all' }}
+          COUNT_IN: ${{ inputs.count || '' }}
+          VIDEO_IN: ${{ inputs.video || false }}
+          CMD_IN: ${{ inputs.cmd || '' }}
+        run: python memradar.py --mode "$MODE" --lang "$LANG_IN" --count "$COUNT_IN" --video "$VIDEO_IN" --cmd "$CMD_IN"
+
+      - name: Сохранить состояние
+        if: always()
+        run: |
+          git config user.name "memradar-bot"
+          git config user.email "memradar-bot@users.noreply.github.com"
+          git add state.json sources.json
+          if git diff --cached --quiet; then echo "Без изменений"; exit 0; fi
+          git commit -m "memradar: состояние $(date -u +%F' '%H:%M)"
+          for i in 1 2 3; do git pull --rebase -X theirs && git push && exit 0; sleep 5; done
