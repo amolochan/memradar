@@ -1,0 +1,18 @@
+{
+  "settings": {
+    "every_hours": 4,
+    "count": 8,
+    "max_per_source": 2,
+    "window_hours": 24,
+    "paused": false
+  },
+  "telegram": {
+    "ru": ["membeztexta", "memreels", "delaimem", "formemas", "pelmems_reels", "reels_memes",
+           "video_smeshnye", "community_memy", "memes_dvach", "memachh", "batek_official",
+           "yu6_6kan", "prikotik", "brokencats", "memyprokotow"],
+    "ua": ["memargam", "meme4reels", "meme4reels_ua", "novinach", "ukrainiatrash"],
+    "en": ["bestmemes", "dankmemesgang", "FunkJoy"]
+  },
+  "lemmy": ["memes@lemmy.world", "lemmyshitpost@lemmy.world", "memes@lemmy.ml"],
+  "reddit": ["memes", "dankmemes", "MemeVideos", "funny"]
+}
