@@ -54,6 +54,7 @@ HELP_OWNER = """<b>Мем-радар</b>: самые залетевшие мем
 ➕ <b>Добавить</b> / ➖ <b>Удалить</b> источник
 ⚙️ <b>Настройки</b>: как часто и сколько присылать, пауза
 👥 <b>Подписчики</b>: кто получает подборки, блокировка
+🌐 <b>Языки мемов</b>: какие присылать вам — 🇺🇦 / 🇷🇺 / 🇬🇧
 
 Добавить канал можно и проще: пришлите ссылку на него (t.me/…) или @ник.
 Друзьям отправьте ссылку на бота: после /start они будут получать подборки,
@@ -65,6 +66,7 @@ HELP_USER = """<b>Мем-радар</b> присылает самые залет
 🔥 <b>Топ за сутки</b>: лучшие мемы за 24 часа
 ⚡ <b>Залетает сейчас</b>: что набирает обороты за 4 часа
 🎬 <b>Только видео</b>: для монтажа
+🌐 <b>Языки мемов</b>: выберите, какие присылать — 🇺🇦 / 🇷🇺 / 🇬🇧
 🔕 <b>Отписаться</b>: перестать получать подборки
 
 Ответ на кнопку приходит за 1–2 минуты.{limit}"""
@@ -122,6 +124,7 @@ PRIV.setdefault("subs", {})       # chat_id -> {"name", "since", "last", "active
 PRIV.setdefault("banned", {})     # chat_id -> name
 PRIV.setdefault("seen", {})       # chat_id -> [id мемов, которые уже получил вручную]
 PRIV.setdefault("await", {})      # chat_id -> "add" (владелец ждёт ввода источника)
+PRIV.setdefault("langs", {})      # chat_id -> ["ua", "ru", "en"]: какие мемы присылать
 if STATE.get("owner"):            # старая версия хранила владельца открыто
     PRIV.setdefault("owner", STATE.pop("owner"))
 
@@ -138,6 +141,11 @@ def save():
 
 def owner_chat():
     return OWNER or PRIV.get("owner")
+
+
+def user_langs(chat):
+    got = [l for l in PRIV["langs"].get(str(chat), LANGS) if l in LANGS]
+    return got or list(LANGS)
 
 
 def is_owner(uid):
@@ -321,16 +329,24 @@ def fetch_reddit(sub, hours):
     return out
 
 
-def collect(lang="all", hours=24, only_video=False, report=None, exclude=None):
+def as_langs(lang):
+    """'all' | 'ua' | ['ua','en'] -> множество языков."""
+    if not lang or lang == "all":
+        return set(LANGS)
+    return {lang} if isinstance(lang, str) else set(lang)
+
+
+def gather(langs, hours, report=None):
+    """Собирает и оценивает посты из всех источников нужных языков."""
     pool = []
     for lg, chans in SRC["telegram"].items():
-        if lang in ("all", lg):
+        if lg in langs:
             for ch in chans:
                 ps = hot_scores(fetch_tg(ch, lg, hours), time.time())
                 if report is not None:
                     report.append(f"@{ch}: {len(ps)}")
                 pool += ps
-    if lang in ("all", "en"):
+    if "en" in langs:
         for comm in SRC["lemmy"]:
             ps = hot_scores(fetch_lemmy(comm, hours), time.time())
             if report is not None:
@@ -341,16 +357,26 @@ def collect(lang="all", hours=24, only_video=False, report=None, exclude=None):
             if report is not None and (REDDIT_ID and REDDIT_SECRET):
                 report.append(f"r/{sub}: {len(ps)}")
             pool += ps
+    return pool
+
+
+def select(pool, langs, exclude=None, only_video=False):
+    """Отбирает лучшее: нужные языки, без уже присланного, не больше max_per_source с одного источника."""
     ex = exclude if exclude is not None else set(STATE["sent"])
-    pool = [p for p in pool if p["id"] not in ex and (not only_video or p["kind"] == "video")]
-    pool.sort(key=lambda p: p["score"], reverse=True)
+    items = [p for p in pool if p["lang"] in langs and p["id"] not in ex and (not only_video or p["kind"] == "video")]
+    items.sort(key=lambda p: p["score"], reverse=True)
     per, top = {}, []
-    for p in pool:
+    for p in items:
         if per.get(p["source"], 0) >= SET["max_per_source"]:
             continue
         per[p["source"]] = per.get(p["source"], 0) + 1
         top.append(p)
     return top
+
+
+def collect(lang="all", hours=24, only_video=False, report=None, exclude=None):
+    langs = as_langs(lang)
+    return select(gather(langs, hours, report), langs, exclude, only_video)
 
 
 # ---------------------------------------------------------------- отправка
@@ -418,8 +444,8 @@ def recipients():
     return out
 
 
-def deliver(chats, top, n, title, more=True):
-    cache = {}
+def deliver(chats, top, n, title, more=True, cache=None):
+    cache = {} if cache is None else cache
     for chat in chats:
         if say(f"🔥 <b>{title}</b> · {min(n, len(top))} шт.", chat).get("error_code") == 403:
             mark_blocked(chat)
@@ -445,10 +471,12 @@ def mark_blocked(chat):
         log("Подписчик заблокировал бота, отписываю:", chat)
 
 
-def personal_digest(chat, n=None, lang="all", hours=None, only_video=False, title="Топ мемов"):
+def personal_digest(chat, n=None, lang=None, hours=None, only_video=False, title="Топ мемов"):
+    """lang=None: языки из настроек пользователя; 'ua' и т.п.: разовый выбор (кнопки «Ещё»)."""
     n = n or SET["count"]
     hours = hours or SET["window_hours"]
-    top = collect(lang, hours, only_video, exclude=set(PRIV["seen"].get(str(chat), [])))
+    langs = as_langs(lang) if lang and lang != "all" else set(user_langs(chat))
+    top = collect(langs, hours, only_video, exclude=set(PRIV["seen"].get(str(chat), [])))
     if not top:
         return say("Свежих залётов пока нет, загляните чуть позже 🙂", chat)
     deliver([chat], top, n, title)
@@ -458,13 +486,21 @@ def broadcast(title="Подборка мемов"):
     chats = recipients()
     if not chats:
         return log("Некому слать: нет владельца и подписчиков")
-    top = collect("all", SET["window_hours"])
-    if not top:
-        return log("Свежих мемов для рассылки нет")
-    n = SET["count"]
-    STATE["sent"] += [p["id"] for p in top[:n]]
-    deliver(chats, top, n, title)
-    log(f"Рассылка: {min(n, len(top))} мемов, получателей: {len(chats)}")
+    groups = {}
+    for c in chats:                                   # одинаковый набор языков = одна подборка
+        groups.setdefault(tuple(sorted(user_langs(c))), []).append(c)
+    need = set().union(*map(set, groups))
+    pool = gather(need, SET["window_hours"])
+    n, cache, sent_now = SET["count"], {}, set()
+    for langs, members in groups.items():
+        top = select(pool, set(langs))
+        if not top:
+            log("Нет свежих мемов для", langs)
+            continue
+        sent_now |= {p["id"] for p in top[:n]}
+        deliver(members, top, n, title + " · " + "/".join(FLAGS[l].split()[0] for l in LANGS if l in langs), cache=cache)
+    STATE["sent"] += list(sent_now)
+    log(f"Рассылка: групп по языкам {len(groups)}, получателей {len(chats)}")
 
 
 # ---------------------------------------------------------------- кнопки
@@ -472,17 +508,18 @@ B_TOP, B_HOT, B_VIDEO = "🔥 Топ за сутки", "⚡ Залетает с�
 B_SRC, B_ADD, B_DEL = "📋 Источники", "➕ Добавить источник", "➖ Удалить источник"
 B_SET, B_HELP, B_USERS = "⚙️ Настройки", "❓ Помощь", "👥 Подписчики"
 B_UNSUB, B_SUB = "🔕 Отписаться", "🔔 Подписаться"
+B_LANG = "🌐 Языки мемов"
 OWNER_KB = {"keyboard": [[{"text": B_TOP}, {"text": B_HOT}], [{"text": B_VIDEO}, {"text": B_SRC}],
                          [{"text": B_ADD}, {"text": B_DEL}], [{"text": B_SET}, {"text": B_USERS}],
-                         [{"text": B_HELP}]],
+                         [{"text": B_LANG}, {"text": B_HELP}]],
             "resize_keyboard": True, "is_persistent": True,
             "input_field_placeholder": "Нажмите кнопку или пришлите ссылку на канал"}
 
 
 def user_kb(chat):
     sub = PRIV["subs"].get(str(chat), {}).get("active", False)
-    return {"keyboard": [[{"text": B_TOP}, {"text": B_HOT}], [{"text": B_VIDEO}, {"text": B_HELP}],
-                         [{"text": B_UNSUB if sub else B_SUB}]],
+    return {"keyboard": [[{"text": B_TOP}, {"text": B_HOT}], [{"text": B_VIDEO}, {"text": B_LANG}],
+                         [{"text": B_HELP}, {"text": B_UNSUB if sub else B_SUB}]],
             "resize_keyboard": True, "is_persistent": True}
 
 
@@ -493,9 +530,10 @@ def kb_for(chat):
 FLAGS = {"ru": "🇷🇺 RU", "ua": "🇺🇦 UA", "en": "🇬🇧 EN"}
 OWNER_COMMANDS = [("start", "Меню и кнопки"), ("top", "Топ мемов за сутки"), ("hot", "Что залетает сейчас"),
                   ("video", "Только видео"), ("sources", "Источники"), ("add", "Добавить источник"),
-                  ("del", "Удалить источник"), ("settings", "Настройки"), ("users", "Подписчики"), ("help", "Помощь")]
+                  ("del", "Удалить источник"), ("settings", "Настройки"), ("users", "Подписчики"),
+                  ("lang", "Какие мемы присылать: UA/RU/EN"), ("help", "Помощь")]
 USER_COMMANDS = [("start", "Подписаться и открыть меню"), ("top", "Топ мемов за сутки"), ("hot", "Что залетает сейчас"),
-                 ("video", "Только видео"), ("stop", "Отписаться"), ("help", "Помощь")]
+                 ("video", "Только видео"), ("lang", "Какие мемы присылать: UA/RU/EN"), ("stop", "Отписаться"), ("help", "Помощь")]
 
 
 def btn(text, data):
@@ -508,6 +546,19 @@ def ikb(rows):
 
 MORE_KB = ikb([[btn("🇷🇺 RU", "top:ru"), btn("🇺🇦 UA", "top:ua"), btn("🇬🇧 EN", "top:en")],
                [btn("🎬 Видео", "video:all"), btn("⚡ Свежак", "hot:all")]])
+
+
+LANG_NAMES = {"ua": "🇺🇦 Українські", "ru": "🇷🇺 Русские", "en": "🇬🇧 Английские"}
+
+
+def lang_view(chat, note=""):
+    cur = user_langs(chat)
+    text = ((note + "\n\n") if note else "") + ("<b>🌐 Какие мемы присылать?</b>\nНажмите, чтобы включить или выключить. "
+            "Это влияет и на подборки по расписанию, и на кнопки 🔥 ⚡ 🎬.\n\nСейчас: "
+            + ", ".join(LANG_NAMES[l] for l in LANGS if l in cur))
+    kb = ikb([[btn(("✅ " if l in cur else "▫️ ") + LANG_NAMES[l], f"lang:{l}")] for l in ("ua", "ru", "en")]
+             + [[btn("Готово", "close")]])
+    return text, kb
 
 
 def norm_channel(s):
@@ -725,7 +776,7 @@ def user_request(chat, fn):
 
 # ---------------------------------------------------------------- обработка сообщений и кнопок
 SIMPLE = {B_TOP: "/top", B_HOT: "/hot", B_VIDEO: "/video", B_SRC: "/sources", B_ADD: "/add", B_DEL: "/del",
-          B_SET: "/settings", B_HELP: "/help", B_USERS: "/users", B_UNSUB: "/stop", B_SUB: "/start"}
+          B_SET: "/settings", B_HELP: "/help", B_USERS: "/users", B_UNSUB: "/stop", B_SUB: "/start", B_LANG: "/lang"}
 
 
 def handle(text, chat, name=""):
@@ -764,9 +815,18 @@ def handle(text, chat, name=""):
         if owner:
             return say(HELP_OWNER, chat, OWNER_KB)
         subscribe(chat, name)
-        return say("✅ Вы подписаны!\n\n" + user_help(), chat, user_kb(chat))
+        say("✅ Вы подписаны!\n\n" + user_help(), chat, user_kb(chat))
+        t, k = lang_view(chat)
+        return say(t, chat, k)
     if cmd == "/help":
         return say(HELP_OWNER if owner else user_help(), chat, kb_for(chat))
+    if cmd == "/lang":
+        if args:                                       # /lang ua en
+            picked = [x.lower() for x in args if x.lower() in LANGS]
+            if picked:
+                PRIV["langs"][chat] = picked
+        t, k = lang_view(chat)
+        return say(t, chat, k)
     if cmd == "/top":
         return user_request(chat, lambda: personal_digest(chat, n, lang, 24))
     if cmd == "/hot":
@@ -848,6 +908,13 @@ def handle_cb(data, chat, mid, cb_id=None):
         return user_request(chat, lambda: personal_digest(chat, None, lang, 24, only_video=True, title="Топ видеомемов"))
     if kind == "close":
         return tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup=json.dumps(ikb([])))
+    if kind == "lang" and rest in LANGS:
+        cur = user_langs(chat)
+        if rest in cur and len(cur) == 1:
+            return edit(chat, mid, *lang_view(chat, "⚠️ Хотя бы один язык должен остаться включённым."))
+        new = [l for l in cur if l != rest] if rest in cur else cur + [rest]
+        PRIV["langs"][chat] = [l for l in LANGS if l in new]
+        return edit(chat, mid, *lang_view(chat))
     if not is_owner(chat):
         return
 
