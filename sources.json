@@ -1,7 +1,7 @@
 {
   "settings": {
     "every_hours": 4,
-    "count": 8,
+    "count": 10,
     "max_per_source": 2,
     "window_hours": 24,
     "paused": false
