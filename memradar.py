@@ -606,12 +606,17 @@ def add_tg(ch, lg, chat):
 
 def bulk_add(chs, lg, chat):
     """Добавляет сразу много каналов: только живые (открытая веб-версия и медиапосты за последнюю неделю)."""
-    say(f"⏳ Проверяю {len(chs)} каналов, это займёт 1–2 минуты…", chat)
-    added, stale, closed, had = [], [], [], []
-    existing = {c for l in SRC["telegram"].values() for c in l}
+    say(f"⏳ Проверяю {len(chs)} каналов, это займёт 1–2 минуты…", chat) if len(chs) > 3 else None
+    added, stale, closed, had, moved = [], [], [], [], []
+    where = {c: l for l, cs in SRC["telegram"].items() for c in cs}
     for ch in dict.fromkeys(chs):
-        if ch in existing:
+        if where.get(ch) == lg:
             had.append(ch)
+            continue
+        if ch in where:                                   # уже есть в другом разделе: переносим без проверки
+            SRC["telegram"][where[ch]].remove(ch)
+            SRC["telegram"].setdefault(lg, []).append(ch)
+            moved.append(f"@{ch} ({where[ch].upper()} → {lg.upper()})")
             continue
         posts = fetch_tg(ch, lg, 24 * 7)
         if posts:
@@ -630,8 +635,10 @@ def bulk_add(chs, lg, chat):
         lines.append(f"💤 Не добавлены, нет картинок и видео за неделю ({len(stale)}): " + ", ".join(stale))
     if closed:
         lines.append(f"🚫 Не добавлены, нет веб-версии или канал не существует ({len(closed)}): " + ", ".join(closed))
+    if moved:
+        lines.append(f"🔀 Перенесены ({len(moved)}): " + ", ".join(moved))
     if had:
-        lines.append("Уже были в списке: " + ", ".join("@" + c for c in had))
+        lines.append("Уже были в этом разделе: " + ", ".join("@" + c for c in had))
     say("\n\n".join(lines), chat, OWNER_KB)
 
 
@@ -782,7 +789,10 @@ def handle(text, chat, name=""):
         tg_many = [detect_source(x, loose=True) for x in args if x.lower() not in LANGS]
         tg_many = [v for t_, v in (x for x in tg_many if x) if t_ == "tg"]
         if len(tg_many) > 1:
-            lg = next((x.lower() for x in args if x.lower() in LANGS), "ru")
+            lg = next((x.lower() for x in args if x.lower() in LANGS), None)
+            if not lg:
+                return say("В какой раздел добавить? Допишите в конце сообщения <code>ru</code>, <code>ua</code> или <code>en</code>, "
+                           "например: <code>/add @один @второй ua</code>", chat)
             return bulk_add(tg_many, lg, chat)
         src = detect_source(args[0], loose=True)
         if not src:
