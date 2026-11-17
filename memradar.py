@@ -604,6 +604,37 @@ def add_tg(ch, lg, chat):
     say(f"✅ Добавил @{html.escape(ch)} в {FLAGS[lg]}" + (f"\nМедиапостов за неделю: {len(test)}" if test else ""), chat, OWNER_KB)
 
 
+def bulk_add(chs, lg, chat):
+    """Добавляет сразу много каналов: только живые (открытая веб-версия и медиапосты за последнюю неделю)."""
+    say(f"⏳ Проверяю {len(chs)} каналов, это займёт 1–2 минуты…", chat)
+    added, stale, closed, had = [], [], [], []
+    existing = {c for l in SRC["telegram"].values() for c in l}
+    for ch in dict.fromkeys(chs):
+        if ch in existing:
+            had.append(ch)
+            continue
+        posts = fetch_tg(ch, lg, 24 * 7)
+        if posts:
+            SRC["telegram"].setdefault(lg, []).append(ch)
+            added.append(f"@{ch} ({len(posts)})")
+            continue
+        try:
+            page = requests.get(f"https://t.me/s/{ch}", headers={"User-Agent": UA}, timeout=30).text
+        except Exception:
+            page = ""
+        (stale if "tgme_widget_message" in page else closed).append("@" + ch)
+    lines = [f"<b>Готово: раздел {FLAGS[lg]}</b>"]
+    if added:
+        lines.append(f"✅ Добавлены ({len(added)}), в скобках медиапостов за неделю:\n" + ", ".join(added))
+    if stale:
+        lines.append(f"💤 Не добавлены, нет картинок и видео за неделю ({len(stale)}): " + ", ".join(stale))
+    if closed:
+        lines.append(f"🚫 Не добавлены, нет веб-версии или канал не существует ({len(closed)}): " + ", ".join(closed))
+    if had:
+        lines.append("Уже были в списке: " + ", ".join("@" + c for c in had))
+    say("\n\n".join(lines), chat, OWNER_KB)
+
+
 def add_lemmy(c, chat):
     if not fetch_lemmy(c, 24 * 7):
         return say(f"😕 Не получилось прочитать {html.escape(c)}. Проверьте название в формате <code>сообщество@сервер</code>, "
@@ -642,6 +673,7 @@ def ask_add(chat):
     PRIV["await"][str(chat)] = "add"
     say("➕ <b>Пришлите источник</b> одним сообщением:\n\n"
         "• Telegram-канал: ссылка <code>t.me/имя</code> или <code>@имя</code>\n"
+        "• много каналов сразу: <code>/add @один @второй @третий ua</code>\n"
         "• Lemmy: <code>memes@lemmy.world</code>\n"
         "• Reddit: <code>r/memes</code>", chat,
         {"force_reply": True, "input_field_placeholder": "@канал, memes@lemmy.world или r/memes"})
@@ -747,6 +779,11 @@ def handle(text, chat, name=""):
     elif cmd == "/add":
         if not args:
             return ask_add(chat)
+        tg_many = [detect_source(x, loose=True) for x in args if x.lower() not in LANGS]
+        tg_many = [v for t_, v in (x for x in tg_many if x) if t_ == "tg"]
+        if len(tg_many) > 1:
+            lg = next((x.lower() for x in args if x.lower() in LANGS), "ru")
+            return bulk_add(tg_many, lg, chat)
         src = detect_source(args[0], loose=True)
         if not src:
             return say("Не понял, что добавить. Пример: <code>/add @канал ua</code>", chat)
