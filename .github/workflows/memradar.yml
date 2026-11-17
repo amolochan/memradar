@@ -2,6 +2,7 @@ name: Мем-радар
 
 on:
   schedule:
+    # каждые 10 минут: проверяет команды из чата; подборку шлёт раз в N часов (настройка every_hours)
     - cron: "3-59/10 * * * *"
   workflow_dispatch:
     inputs:
@@ -24,7 +25,7 @@ on:
         type: boolean
         default: false
       cmd:
-        description: "Команда (для режима command)"
+        description: "Команда (для режима command, например /top 5 ua)"
         required: false
         default: ""
 
@@ -32,7 +33,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: memradar
+  # нажатия кнопок (command) идут параллельно, чтобы не терялись; расписание и подборки — по одному
+  group: memradar-${{ inputs.mode == 'command' && github.run_id || 'main' }}
   cancel-in-progress: false
 
 jobs:
@@ -64,10 +66,23 @@ jobs:
 
       - name: Сохранить состояние
         if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
           git config user.name "memradar-bot"
           git config user.email "memradar-bot@users.noreply.github.com"
           git add state.json sources.json
           if git diff --cached --quiet; then echo "Без изменений"; exit 0; fi
-          git commit -m "memradar: состояние $(date -u +%F' '%H:%M)"
-          for i in 1 2 3; do git pull --rebase -X theirs && git push && exit 0; sleep 5; done
+          git commit -q -m "memradar: состояние $(date -u +%F' '%H:%M)"
+          for i in 1 2 3 4 5; do
+            git push -q && exit 0
+            echo "Параллельный запуск успел раньше, сливаю состояние (попытка $i)"
+            git fetch -q origin main
+            python memradar.py --mode merge
+            git reset -q origin/main
+            git add state.json sources.json
+            git diff --cached --quiet && exit 0
+            git commit -q -m "memradar: состояние (слито) $(date -u +%F' '%H:%M)"
+            sleep $((RANDOM % 5 + 2))
+          done
+          exit 1
