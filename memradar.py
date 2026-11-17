@@ -45,7 +45,6 @@ REDDIT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 API = f"https://api.telegram.org/bot{TOKEN}"
 LANGS = ("ru", "ua", "en")
-USER_COOLDOWN = 10 * 60           # подписчик может запросить подборку вручную раз в 10 минут
 
 HELP_OWNER = """<b>Мем-радар</b>: самые залетевшие мемы из Telegram, Lemmy и Reddit.
 
@@ -68,7 +67,12 @@ HELP_USER = """<b>Мем-радар</b> присылает самые залет
 🎬 <b>Только видео</b>: для монтажа
 🔕 <b>Отписаться</b>: перестать получать подборки
 
-Ручной запрос: не чаще раза в 10 минут. Ответ приходит за 1–2 минуты."""
+Ответ на кнопку приходит за 1–2 минуты.{limit}"""
+
+
+def user_help():
+    m = SET["user_cooldown_min"]
+    return HELP_USER.format(every=SET["every_hours"], limit=f"\nРучной запрос: не чаще раза в {m} мин." if m else "")
 
 
 def log(*a):
@@ -106,7 +110,8 @@ STATE.setdefault("sent", [])
 STATE.setdefault("offset", 0)
 STATE.setdefault("last_digest", 0)
 SET = SRC.setdefault("settings", {})
-for k, v in {"every_hours": 4, "count": 8, "max_per_source": 2, "window_hours": 24, "paused": False}.items():
+for k, v in {"every_hours": 4, "count": 8, "max_per_source": 2, "window_hours": 24, "paused": False,
+             "user_cooldown_min": 0}.items():
     SET.setdefault(k, v)
 SRC.setdefault("telegram", {l: [] for l in LANGS})
 SRC.setdefault("lemmy", [])
@@ -548,11 +553,13 @@ def del_kb():
 def settings_view():
     on = lambda cond, label: ("✅ " if cond else "") + label
     text = (f"<b>⚙️ Настройки</b>\nПодборка: каждые <b>{SET['every_hours']} ч</b>, по <b>{SET['count']}</b> мемов\n"
+            f"Друзья могут запрашивать вручную: {'без ограничений' if not SET['user_cooldown_min'] else 'раз в ' + str(SET['user_cooldown_min']) + ' мин'}\n"
             f"Статус: {'⏸ на паузе' if SET['paused'] else '▶️ работает'}\n\nНажмите, чтобы изменить:")
     kb = ikb([
         [btn(on(SET["every_hours"] == h, f"каждые {h} ч" if h == 2 else f"{h} ч"), f"every:{h}") for h in (2, 4, 6)],
         [btn(on(SET["every_hours"] == h, f"{h} ч"), f"every:{h}") for h in (8, 12, 24)],
         [btn(on(SET["count"] == c, f"{c} мемов" if c == 5 else str(c)), f"count:{c}") for c in (5, 8, 10, 15)],
+        [btn(on(SET["user_cooldown_min"] == m, "друзья: без лимита" if m == 0 else f"{m} мин"), f"cool:{m}") for m in (0, 2, 10)],
         [btn("▶️ Включить рассылку", "resume") if SET["paused"] else btn("⏸ Пауза", "pause")],
         [btn("🧪 Проверить источники", "test"), btn("♻️ Забыть историю", "reset")],
     ])
@@ -664,7 +671,7 @@ def cooldown_left(chat):
     if is_owner(chat):
         return 0
     s = PRIV["subs"].get(str(chat), {})
-    return max(0, int(s.get("last", 0) + USER_COOLDOWN - time.time()))
+    return max(0, int(s.get("last", 0) + SET["user_cooldown_min"] * 60 - time.time()))
 
 
 def user_request(chat, fn):
@@ -718,9 +725,9 @@ def handle(text, chat, name=""):
         if owner:
             return say(HELP_OWNER, chat, OWNER_KB)
         subscribe(chat, name)
-        return say("✅ Вы подписаны!\n\n" + HELP_USER.format(every=SET["every_hours"]), chat, user_kb(chat))
+        return say("✅ Вы подписаны!\n\n" + user_help(), chat, user_kb(chat))
     if cmd == "/help":
-        return say(HELP_OWNER if owner else HELP_USER.format(every=SET["every_hours"]), chat, kb_for(chat))
+        return say(HELP_OWNER if owner else user_help(), chat, kb_for(chat))
     if cmd == "/top":
         return user_request(chat, lambda: personal_digest(chat, n, lang, 24))
     if cmd == "/hot":
@@ -810,8 +817,8 @@ def handle_cb(data, chat, mid, cb_id=None):
         label = ("@" + val) if typ == "tg" else ("r/" + val) if typ == "rd" else val
         edit(chat, mid, (f"🗑 Удалил {html.escape(label)}\n\n" if ok else "Этого источника уже нет.\n\n")
              + "➖ Нажмите на источник, чтобы удалить его:", del_kb())
-    elif kind in ("every", "count") and rest.isdigit():
-        SET["every_hours" if kind == "every" else "count"] = int(rest)
+    elif kind in ("every", "count", "cool") and rest.isdigit():
+        SET[{"every": "every_hours", "count": "count", "cool": "user_cooldown_min"}[kind]] = int(rest)
         edit(chat, mid, *settings_view())
     elif kind in ("pause", "resume"):
         SET["paused"] = kind == "pause"
