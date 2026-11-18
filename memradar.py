@@ -24,6 +24,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -34,7 +35,7 @@ import requests
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet, InvalidToken
 
-from scoring import hot_scores, is_ad
+from scoring import hot_scores, junk_reason
 
 BASE = Path(__file__).resolve().parent
 SRC_FILE, STATE_FILE = BASE / "sources.json", BASE / "state.json"
@@ -131,6 +132,9 @@ if STATE.get("owner"):            # старая версия хранила в�
 
 def save():
     STATE["sent"] = STATE["sent"][-4000:]
+    STATE["junk"] = STATE.get("junk", [])[-3000:]
+    if len(STATE.get("recent", {})) > 400:
+        STATE["recent"] = dict(list(STATE["recent"].items())[-400:])
     for k in list(PRIV["seen"]):
         PRIV["seen"][k] = PRIV["seen"][k][-500:]
     if FERNET and (json.dumps(PRIV, sort_keys=True, ensure_ascii=False) != _PRIV_SNAPSHOT or "private" not in STATE):
@@ -205,11 +209,22 @@ def parse_tme(html_text, channel, lang):
         if not t or not v:
             continue
         ts = datetime.fromisoformat(t["datetime"].replace("Z", "+00:00")).timestamp()
+        if m.select_one(".tgme_widget_message_forwarded_from"):
+            continue                                         # репост из другого канала: чаще новости или реклама
         text_el = m.select_one(".tgme_widget_message_text")
         text = text_el.get_text(" ", strip=True) if text_el else ""
-        if is_ad(text):
-            continue
+        if len(text) > 400 or junk_reason(text):
+            continue                                         # длинный текст = новость/пост, а не мем
+        foreign = [a.get("href", "") for a in (text_el.select("a[href]") if text_el else [])
+                   if re.search(r"t\.me/(?!" + re.escape(channel) + r"\b)", a.get("href", ""), re.I)]
+        if foreign:
+            continue                                         # ссылки на чужие каналы = взаимопиар
         kind, media = None, None
+        thumb = None
+        th = m.select_one(".tgme_widget_message_video_thumb[style]")
+        if th:
+            u = re.search(r"url\(['\"]?(.*?)['\"]?\)", th["style"])
+            thumb = u.group(1) if u else None
         vid = m.select_one("video.tgme_widget_message_video, video[src]")
         if vid and vid.get("src"):
             kind, media = "video", vid["src"]
@@ -226,7 +241,8 @@ def parse_tme(html_text, channel, lang):
         reacts = sum(parse_count(x.get_text()) for x in m.select(".tgme_reaction"))
         posts.append({"src": "tg", "source": "@" + channel, "lang": lang, "id": f"tg:{channel}/{pid}",
                       "kind": kind, "media": media, "views": parse_count(v.get_text()), "reactions": reacts,
-                      "forwards": 0, "ts": ts, "text": text[:300], "link": f"https://t.me/{channel}/{pid}"})
+                      "forwards": 0, "ts": ts, "text": text[:300], "link": f"https://t.me/{channel}/{pid}",
+                      "thumb": thumb})
     return posts, oldest
 
 
@@ -266,7 +282,7 @@ def fetch_lemmy(comm, hours):
     out = []
     for it in items:
         p, c = it.get("post", {}), it.get("counts", {})
-        if p.get("nsfw") or p.get("removed") or p.get("deleted"):
+        if p.get("nsfw") or p.get("removed") or p.get("deleted") or junk_reason(p.get("name", "")):
             continue
         url = p.get("url") or ""
         low = url.lower().split("?")[0]
@@ -313,7 +329,7 @@ def fetch_reddit(sub, hours):
     out = []
     for ch in children:
         d = ch.get("data", {})
-        if d.get("over_18") or d.get("stickied"):
+        if d.get("over_18") or d.get("stickied") or junk_reason(d.get("title", "")):
             continue
         url = d.get("url_overridden_by_dest") or d.get("url", "")
         if d.get("is_video"):
@@ -362,7 +378,7 @@ def gather(langs, hours, report=None):
 
 def select(pool, langs, exclude=None, only_video=False):
     """Отбирает лучшее: нужные языки, без уже присланного, не больше max_per_source с одного источника."""
-    ex = exclude if exclude is not None else set(STATE["sent"])
+    ex = (exclude if exclude is not None else set(STATE["sent"])) | set(STATE.get("junk", []))
     items = [p for p in pool if p["lang"] in langs and p["id"] not in ex and (not only_video or p["kind"] == "video")]
     items.sort(key=lambda p: p["score"], reverse=True)
     per, top = {}, []
@@ -377,6 +393,75 @@ def select(pool, langs, exclude=None, only_video=False):
 def collect(lang="all", hours=24, only_video=False, report=None, exclude=None):
     langs = as_langs(lang)
     return select(gather(langs, hours, report), langs, exclude, only_video)
+
+
+# ---------------------------------------------------------------- проверка текста на картинке (OCR)
+MEDIA, OCR_CACHE, _OCR = {}, {}, {"ready": None}
+OCR_LANGS = "ukr+rus+eng"
+
+
+def fetch_media(url, limit):
+    if url in MEDIA:
+        return MEDIA[url]
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=90, stream=True)
+    data = b""
+    for chunk in r.iter_content(1 << 16):
+        data += chunk
+        if len(data) > limit:
+            raise ValueError("файл слишком большой")
+    MEDIA[url] = data
+    return data
+
+
+def ocr_ready():
+    """Tesseract ставится только когда нужен (≈20 с), чтобы нажатия настроек не замедлялись."""
+    if _OCR["ready"] is not None:
+        return _OCR["ready"]
+    ok = bool(shutil.which("tesseract"))
+    if not ok and os.getenv("GITHUB_ACTIONS"):
+        log("Ставлю распознавание текста (tesseract)…")
+        try:
+            subprocess.run("sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+                           "tesseract-ocr tesseract-ocr-ukr tesseract-ocr-rus >/dev/null", shell=True, timeout=240, check=True)
+            ok = bool(shutil.which("tesseract"))
+        except Exception as e:
+            log("Не удалось поставить tesseract, проверяю только подписи:", e)
+    _OCR["ready"] = ok
+    return ok
+
+
+def image_junk(p):
+    """Читает текст на картинке (или на превью видео) и ищет рекламу, новости, 18+."""
+    url = p.get("media") if p["kind"] == "photo" else p.get("thumb")
+    if not url or not ocr_ready():
+        return None
+    if p["id"] in OCR_CACHE:
+        return OCR_CACHE[p["id"]]
+    try:
+        data = fetch_media(url, 9 * 1024 * 1024)
+        out = subprocess.run(["tesseract", "stdin", "stdout", "-l", OCR_LANGS, "--psm", "3"],
+                             input=data, capture_output=True, timeout=40).stdout.decode("utf-8", "ignore")
+    except Exception as e:
+        log("OCR не получился:", p["link"], e)
+        out = ""
+    reason = junk_reason(" ".join(out.split()))
+    OCR_CACHE[p["id"]] = reason
+    return reason
+
+
+def clean(top, n):
+    """Берёт лучшие n постов, отбрасывая те, где на картинке реклама, новость или 18+."""
+    out = []
+    for p in top:
+        if len(out) >= n:
+            break
+        why = image_junk(p)
+        if why:
+            log(f"Отсеян ({why}, текст на картинке):", p["link"])
+            STATE.setdefault("junk", []).append(p["id"])
+            continue
+        out.append(p)
+    return out
 
 
 # ---------------------------------------------------------------- отправка
@@ -402,24 +487,20 @@ def file_id_of(res):
     return None
 
 
-def send_post(chat, p, n, cache):
+def send_post(chat, p, n, cache, kb=None):
     """Отправляет мем. cache[id] хранит file_id, чтобы не заливать один файл много раз.
     Возвращает 'ok', 'blocked' (пользователь заблокировал бота) или 'fail'."""
     cap = caption(p, n)
     method, field = ("sendVideo", "video") if p["kind"] == "video" else ("sendPhoto", "photo")
     extra = {"supports_streaming": "true"} if p["kind"] == "video" else {}
+    if kb:
+        extra["reply_markup"] = json.dumps(kb, ensure_ascii=False)
     j = None
     if cache.get(p["id"]):
         j = tg(method, chat_id=chat, caption=cap, parse_mode="HTML", **{field: cache[p["id"]]}, **extra)
     elif p.get("media"):
         try:
-            r = requests.get(p["media"], headers={"User-Agent": UA}, timeout=90, stream=True)
-            limit = (49 if p["kind"] == "video" else 9) * 1024 * 1024
-            data = b""
-            for chunk in r.iter_content(1 << 16):
-                data += chunk
-                if len(data) > limit:
-                    raise ValueError("файл слишком большой")
+            data = fetch_media(p["media"], (49 if p["kind"] == "video" else 9) * 1024 * 1024)
             ext = ".mp4" if p["kind"] == "video" else ".jpg"
             j = tg(method, chat_id=chat, caption=cap, parse_mode="HTML", files={field: ("meme" + ext, data)}, **extra)
             fid = file_id_of(j.get("result")) if j.get("ok") else None
@@ -430,7 +511,8 @@ def send_post(chat, p, n, cache):
     if not (j and j.get("ok")):
         if j and j.get("error_code") == 403:
             return "blocked"
-        j = tg("sendMessage", chat_id=chat, text=cap, parse_mode="HTML")   # ссылка: Telegram покажет превью
+        j = tg("sendMessage", chat_id=chat, text=cap, parse_mode="HTML",       # ссылка: Telegram покажет превью
+               **({"reply_markup": extra["reply_markup"]} if kb else {}))
     if j.get("error_code") == 403:
         return "blocked"
     return "ok" if j.get("ok") else "fail"
@@ -451,8 +533,14 @@ def deliver(chats, top, n, title, more=True, cache=None):
             mark_blocked(chat)
             continue
         seen = PRIV["seen"].setdefault(str(chat), [])
+        owner = is_owner(chat)
         for i, p in enumerate(top[:n], 1):
-            res = send_post(chat, p, i, cache)
+            kb = None
+            if owner:                                       # владельцу — кнопка «не мем», чтобы чистить источники
+                h = hashlib.md5(p["id"].encode()).hexdigest()[:10]
+                STATE.setdefault("recent", {})[h] = {"id": p["id"], "src": p["source"]}
+                kb = ikb([[btn("👎 Не мем", f"bad:{h}")]])
+            res = send_post(chat, p, i, cache, kb)
             if res == "blocked":
                 mark_blocked(chat)
                 break
@@ -476,7 +564,7 @@ def personal_digest(chat, n=None, lang=None, hours=None, only_video=False, title
     n = n or SET["count"]
     hours = hours or SET["window_hours"]
     langs = as_langs(lang) if lang and lang != "all" else set(user_langs(chat))
-    top = collect(langs, hours, only_video, exclude=set(PRIV["seen"].get(str(chat), [])))
+    top = clean(collect(langs, hours, only_video, exclude=set(PRIV["seen"].get(str(chat), []))), n)
     if not top:
         return say("Свежих залётов пока нет, загляните чуть позже 🙂", chat)
     deliver([chat], top, n, title)
@@ -493,7 +581,7 @@ def broadcast(title="Подборка мемов"):
     pool = gather(need, SET["window_hours"])
     n, cache, sent_now = SET["count"], {}, set()
     for langs, members in groups.items():
-        top = select(pool, set(langs))
+        top = clean(select(pool, set(langs)), n)
         if not top:
             log("Нет свежих мемов для", langs)
             continue
@@ -918,6 +1006,24 @@ def handle_cb(data, chat, mid, cb_id=None):
     if not is_owner(chat):
         return
 
+    if kind == "bad":
+        info = STATE.get("recent", {}).get(rest)
+        tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup=json.dumps(ikb([])))
+        if not info:
+            return say("Этот пост уже слишком старый, отметить не получится.", chat)
+        STATE.setdefault("junk", []).append(info["id"])
+        marks = SRC.setdefault("bad_marks", {})
+        marks[info["src"]] = marks.get(info["src"], 0) + 1
+        src = info["src"]
+        if src.startswith("@"):
+            data = f"del:tg:{src[1:]}"
+        elif src.startswith("r/"):
+            data = f"del:rd:{src[2:]}"
+        else:
+            data = f"del:lm:{src}"
+        return say(f"👌 Учту. У {html.escape(src)} отмечено «не мем»: {marks[src]} раз.\n"
+                   "Если от этого источника часто приходит не то, его лучше удалить.", chat,
+                   ikb([[btn(f"🗑 Удалить {src}"[:40], data), btn("Оставить", "close")]]))
     if kind == "ask":
         ask_add(chat) if rest == "add" else say("➖ Нажмите на источник, чтобы удалить его:", chat, del_kb())
     elif kind == "add":
