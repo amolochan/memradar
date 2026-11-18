@@ -61,5 +61,8 @@
     "dankmemes",
     "MemeVideos",
     "funny"
-  ]
+  ],
+  "bad_marks": {
+    "@baba_i_kit": 1
+  }
 }
