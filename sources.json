@@ -1,6 +1,6 @@
 {
   "settings": {
-    "every_hours": 4,
+    "every_hours": 12,
     "count": 10,
     "max_per_source": 2,
     "window_hours": 24,
