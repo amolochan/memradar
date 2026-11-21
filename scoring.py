@@ -58,5 +58,36 @@ def hot_scores(posts, now_ts):
         if age_h < 6:                       # свежак ещё набирает просмотры
             ratio *= min((6 / age_h) ** 0.5, 3.0)
         eng = (p["reactions"] + 3 * p["forwards"]) / max(p["views"], 1)
-        p["score"] = round(ratio * (1 + 25 * eng), 4)
+        p["score"] = round(ratio * (1 + 25 * eng) * (1 + p.get("laugh", 0)), 4)   # смешные выше
     return posts
+
+
+# ---------------------------------------------------------------- реакции: смех = мем
+LAUGH = set("😁😂🤣😆😄😃😀😅😹🤪😜😝🤭🙃")
+SERIOUS = set("😢😭💔🙏🕊😡🤬😱🫡🤯😨😰😥😞😔🥺🖤🤮💩👎😐🤔")
+MIN_REACTS = 5          # меньше 5 реакций: статистики нет, правило не применяем
+
+
+def norm_emoji(e):
+    e = re.sub("[️‍\U0001F3FB-\U0001F3FF]", "", e or "")
+    return e[:1] if e else ""
+
+
+def laugh_verdict(reacts, mode="strict"):
+    """reacts: [(emoji, count)]. None = пропустить, строка = причина отказа."""
+    if mode == "off" or not reacts:
+        return None
+    reacts = sorted(reacts, key=lambda x: -x[1])
+    if sum(c for _, c in reacts) < MIN_REACTS:
+        return None
+    top = [norm_emoji(e) for e, _ in reacts]
+    if top[0] in LAUGH:
+        return None
+    if mode == "soft" and (any(e in LAUGH for e in top[:3]) or top[0] not in SERIOUS):
+        return None
+    return f"не смешно ({top[0]})"
+
+
+def laugh_share(reacts):
+    total = sum(c for _, c in reacts) or 1
+    return sum(c for e, c in reacts if norm_emoji(e) in LAUGH) / total

@@ -35,7 +35,7 @@ import requests
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet, InvalidToken
 
-from scoring import hot_scores, junk_reason
+from scoring import hot_scores, junk_reason, laugh_verdict, laugh_share, norm_emoji
 
 BASE = Path(__file__).resolve().parent
 SRC_FILE, STATE_FILE = BASE / "sources.json", BASE / "state.json"
@@ -114,7 +114,7 @@ STATE.setdefault("offset", 0)
 STATE.setdefault("last_digest", 0)
 SET = SRC.setdefault("settings", {})
 for k, v in {"every_hours": 4, "count": 8, "max_per_source": 2, "window_hours": 24, "paused": False,
-             "user_cooldown_min": 0}.items():
+             "user_cooldown_min": 0, "laugh": "strict"}.items():
     SET.setdefault(k, v)
 SRC.setdefault("telegram", {l: [] for l in LANGS})
 SRC.setdefault("lemmy", [])
@@ -185,6 +185,30 @@ def edit(chat, mid, text, kb=None):
 
 
 # ---------------------------------------------------------------- источники
+STATS = {}
+
+
+def parse_reactions(m):
+    """[(emoji, count)] из t.me/s; платные звёзды пропускаем."""
+    out = []
+    for x in m.select(".tgme_reaction"):
+        if "tgme_reaction_paid" in (x.get("class") or []):
+            continue
+        raw = x.get_text("", strip=True)
+        cnt = parse_count(raw)
+        emo = re.sub(r"[\d.,\sKMkm]+$", "", raw).strip()
+        if not emo:                                        # картинка-эмодзи: код в имени файла
+            el = x.select_one("[style*='emoji/']")
+            h = re.search(r"emoji/\d+/([0-9A-F]+)\.png", el["style"]) if el else None
+            if h:
+                try:
+                    emo = bytes.fromhex(h.group(1)).decode("utf-8", "ignore")
+                except ValueError:
+                    emo = ""
+        out.append((norm_emoji(emo) or "?", cnt))
+    return out
+
+
 def parse_count(s):
     s = (s or "").strip().upper().replace(",", ".").replace(" ", "")
     m = re.search(r"([\d.]+)([KM]?)", s)
@@ -238,11 +262,15 @@ def parse_tme(html_text, channel, lang):
                     kind, media = "photo", u.group(1)
         if not kind:
             continue
-        reacts = sum(parse_count(x.get_text()) for x in m.select(".tgme_reaction"))
+        rlist = parse_reactions(m)
+        if laugh_verdict(rlist, SET["laugh"]):
+            STATS[channel] = STATS.get(channel, 0) + 1
+            continue                                         # первая реакция не смех: не мем
+        reacts = sum(c for _, c in rlist)
         posts.append({"src": "tg", "source": "@" + channel, "lang": lang, "id": f"tg:{channel}/{pid}",
                       "kind": kind, "media": media, "views": parse_count(v.get_text()), "reactions": reacts,
                       "forwards": 0, "ts": ts, "text": text[:300], "link": f"https://t.me/{channel}/{pid}",
-                      "thumb": thumb})
+                      "thumb": thumb, "laugh": laugh_share(rlist) if rlist else 0})
     return posts, oldest
 
 
@@ -360,7 +388,7 @@ def gather(langs, hours, report=None):
             for ch in chans:
                 ps = hot_scores(fetch_tg(ch, lg, hours), time.time())
                 if report is not None:
-                    report.append(f"@{ch}: {len(ps)}")
+                    report.append(f"@{ch}: {len(ps)}" + (f" (−{STATS[ch]} не смешно)" if STATS.get(ch) else ""))
                 pool += ps
     if "en" in langs:
         for comm in SRC["lemmy"]:
@@ -689,16 +717,21 @@ def del_kb():
     return ikb(rows + [[btn("✅ Готово", "close")]])
 
 
+LAUGH_MODES = {"strict": "😂 первая", "soft": "😂 мягко", "off": "😂 выкл"}
+
+
 def settings_view():
     on = lambda cond, label: ("✅ " if cond else "") + label
     text = (f"<b>⚙️ Настройки</b>\nПодборка: каждые <b>{SET['every_hours']} ч</b>, по <b>{SET['count']}</b> мемов\n"
             f"Друзья могут запрашивать вручную: {'без ограничений' if not SET['user_cooldown_min'] else 'раз в ' + str(SET['user_cooldown_min']) + ' мин'}\n"
+            f"Фильтр по реакциям: <b>{LAUGH_MODES[SET['laugh']]}</b>\n"
             f"Статус: {'⏸ на паузе' if SET['paused'] else '▶️ работает'}\n\nНажмите, чтобы изменить:")
     kb = ikb([
         [btn(on(SET["every_hours"] == h, f"каждые {h} ч" if h == 2 else f"{h} ч"), f"every:{h}") for h in (2, 4, 6)],
         [btn(on(SET["every_hours"] == h, f"{h} ч"), f"every:{h}") for h in (8, 12, 24)],
         [btn(on(SET["count"] == c, f"{c} мемов" if c == 5 else str(c)), f"count:{c}") for c in (5, 8, 10, 15)],
         [btn(on(SET["user_cooldown_min"] == m, "друзья: без лимита" if m == 0 else f"{m} мин"), f"cool:{m}") for m in (0, 2, 10)],
+        [btn(on(SET["laugh"] == k, v), f"laugh:{k}") for k, v in LAUGH_MODES.items()],
         [btn("▶️ Включить рассылку", "resume") if SET["paused"] else btn("⏸ Пауза", "pause")],
         [btn("🧪 Проверить источники", "test"), btn("♻️ Забыть историю", "reset")],
     ])
@@ -828,9 +861,10 @@ def ask_add(chat):
 def run_test(chat):
     rep = []
     top = collect("all", 24, report=rep, exclude=set())
-    bad = [r for r in rep if r.endswith(": 0")]
+    bad = [r for r in rep if r.split(" (")[0].endswith(": 0")]
     say("🧪 <b>Проверка источников</b> (медиапостов за 24 ч)\n" + "\n".join(rep)
         + f"\n\nВсего кандидатов: {len(top)}"
+        + (f"\n😂 Отсеяно по реакциям: {sum(STATS.values())} (режим: {LAUGH_MODES[SET['laugh']]})" if STATS else "")
         + (f"\n⚠️ Пустые: {len(bad)}. Канал мог закрыть веб-версию или ничего не публиковать, такие можно удалить." if bad else ""), chat)
 
 
@@ -1039,6 +1073,9 @@ def handle_cb(data, chat, mid, cb_id=None):
              + "➖ Нажмите на источник, чтобы удалить его:", del_kb())
     elif kind in ("every", "count", "cool") and rest.isdigit():
         SET[{"every": "every_hours", "count": "count", "cool": "user_cooldown_min"}[kind]] = int(rest)
+        edit(chat, mid, *settings_view())
+    elif kind == "laugh" and rest in LAUGH_MODES:
+        SET["laugh"] = rest
         edit(chat, mid, *settings_view())
     elif kind in ("pause", "resume"):
         SET["paused"] = kind == "pause"
